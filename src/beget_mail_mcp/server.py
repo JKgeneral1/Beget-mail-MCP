@@ -26,6 +26,7 @@ from typing import Any
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -449,6 +450,14 @@ used_confirmations: dict[bytes, int] = {}
 confirmation_lock = Lock()
 mcp = FastMCP(
     "Beget Mail",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"] + [
+            host.strip() for host in os.getenv("MCP_ALLOWED_HOSTS", "").split(",")
+            if host.strip()
+        ],
+        allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"],
+    ),
     stateless_http=True,
     json_response=True,
     instructions=(
