@@ -9,10 +9,12 @@ import imaplib
 import json
 import os
 import re
+import secrets
 import smtplib
 import ssl
 import time
 from dataclasses import dataclass
+from threading import Lock
 from email import policy
 from email.header import decode_header, make_header
 from email.message import EmailMessage, Message
@@ -33,6 +35,7 @@ MAX_RESULTS = 50
 MAX_BODY_CHARS = 100_000
 MAX_SEND_BODY_CHARS = 100_000
 CONFIRMATION_TTL_SECONDS = 10 * 60
+CONFIRMATION_INSTANCE_KEY = secrets.token_bytes(32)
 
 
 @dataclass(frozen=True)
@@ -207,9 +210,9 @@ class MailClient:
         connection = self._imap()
         try:
             query_bytes = query.encode("utf-8")
-            status, data = connection.uid("search", "CHARSET", "UTF-8", "TEXT", query_bytes)
-            if status != "OK" and query.isascii():
-                status, data = connection.uid("search", None, "TEXT", query)
+            connection.literal = query_bytes
+            charset = () if query.isascii() else ("CHARSET", "UTF-8")
+            status, data = connection.uid("search", *charset, "TEXT")
             if status != "OK":
                 raise RuntimeError("Beget IMAP did not accept the search query")
             uids = (data[0] or b"").split()[-limit:][::-1]
@@ -262,7 +265,9 @@ class MailClient:
             context=ssl.create_default_context(),
         ) as smtp:
             smtp.login(self.settings.email, self.settings.password)
-            smtp.send_message(message)
+            refused = smtp.send_message(message)
+            if refused:
+                raise RuntimeError("SMTP accepted the message for only some recipients. Do not retry automatically.")
         return SendResult(
             sent=True,
             from_address=self.settings.email,
@@ -288,7 +293,8 @@ def _validate_addresses(values: list[str]) -> list[str]:
 
 def _email_payload(to: list[str], cc: list[str], subject: str, text: str, expires: int) -> bytes:
     return json.dumps(
-        {"to": to, "cc": cc, "subject": subject, "text": text, "expires": expires},
+        {"to": to, "cc": cc, "subject": subject, "text": text, "expires": expires,
+         "nonce": secrets.token_hex(16)},
         sort_keys=True,
         ensure_ascii=False,
         separators=(",", ":"),
@@ -296,7 +302,7 @@ def _email_payload(to: list[str], cc: list[str], subject: str, text: str, expire
 
 
 def _confirmation_key(settings: Settings) -> bytes:
-    return hashlib.sha256(("beget-mail-confirmation:" + settings.bearer_token).encode()).digest()
+    return hmac.digest(CONFIRMATION_INSTANCE_KEY, settings.bearer_token.encode(), "sha256")
 
 
 def _make_confirmation_token(
@@ -317,7 +323,7 @@ def _verify_confirmation_token(
     cc: list[str],
     subject: str,
     text: str,
-) -> None:
+) -> tuple[bytes, int]:
     try:
         payload_part, signature_part = token.split(".", 1)
         payload = base64.urlsafe_b64decode(payload_part + "=" * (-len(payload_part) % 4))
@@ -336,11 +342,13 @@ def _verify_confirmation_token(
         "subject": subject,
         "text": text,
         "expires": stored.get("expires"),
+        "nonce": stored.get("nonce"),
     }
     if stored != expected_payload:
         raise ValueError("Email changed after it was prepared; prepare it again")
     if not isinstance(stored["expires"], int) or stored["expires"] < int(time.time()):
         raise ValueError("Confirmation token expired; prepare the email again")
+    return expected, stored["expires"]
 
 
 def _validate_email_content(
@@ -381,6 +389,8 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
 
 settings = Settings.from_env()
 mail = MailClient(settings)
+used_confirmations: dict[bytes, int] = {}
+confirmation_lock = Lock()
 mcp = FastMCP(
     "Beget Mail",
     instructions=(
@@ -448,7 +458,7 @@ def prepare_email(
 
 @mcp.tool(
     title="Send email",
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True),
 )
 def send_email(
     to: list[str],
@@ -459,9 +469,16 @@ def send_email(
 ) -> SendResult:
     """Send the exact email previously returned by prepare_email after explicit user approval."""
     clean_to, clean_cc = _validate_email_content(to, cc, subject, text)
-    _verify_confirmation_token(
+    signature, expires = _verify_confirmation_token(
         settings, confirmation_token, clean_to, clean_cc, subject, text
     )
+    with confirmation_lock:
+        now = int(time.time())
+        for key in [key for key, deadline in used_confirmations.items() if deadline < now]:
+            del used_confirmations[key]
+        if expires < now or signature in used_confirmations:
+            raise ValueError("Confirmation token expired or was already used")
+        used_confirmations[signature] = expires
     return mail.send(clean_to, clean_cc, subject, text)
 
 
