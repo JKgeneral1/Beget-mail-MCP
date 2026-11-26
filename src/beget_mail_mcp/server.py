@@ -13,7 +13,8 @@ import secrets
 import smtplib
 import ssl
 import time
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from threading import Lock
 from email import policy
 from email.header import decode_header, make_header
@@ -48,33 +49,6 @@ class Settings:
     smtp_host: str = "smtp.beget.com"
     smtp_port: int = 465
     mailbox: str = "INBOX"
-    host: str = "0.0.0.0"
-    port: int = 8000
-
-    @classmethod
-    def from_env(cls) -> "Settings":
-        missing = [
-            name
-            for name in ("BEGET_EMAIL", "BEGET_PASSWORD", "MCP_BEARER_TOKEN")
-            if not os.getenv(name)
-        ]
-        if missing:
-            raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
-        token = os.environ["MCP_BEARER_TOKEN"]
-        if len(token) < 32:
-            raise RuntimeError("MCP_BEARER_TOKEN must contain at least 32 characters")
-        return cls(
-            email=os.environ["BEGET_EMAIL"],
-            password=os.environ["BEGET_PASSWORD"],
-            bearer_token=token,
-            imap_host=os.getenv("BEGET_IMAP_HOST", "imap.beget.com"),
-            imap_port=int(os.getenv("BEGET_IMAP_PORT", "993")),
-            smtp_host=os.getenv("BEGET_SMTP_HOST", "smtp.beget.com"),
-            smtp_port=int(os.getenv("BEGET_SMTP_PORT", "465")),
-            mailbox=os.getenv("BEGET_MAILBOX", "INBOX"),
-            host=os.getenv("HOST", "0.0.0.0"),
-            port=int(os.getenv("PORT", "8000")),
-        )
 
 
 class EmailSummary(BaseModel):
@@ -369,32 +343,76 @@ def _validate_email_content(
 
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: Any, token: str):
+    def __init__(self, app: Any, accounts: tuple[Settings, ...]):
         super().__init__(app)
-        self.token = token
+        self.accounts = accounts
 
     async def dispatch(self, request: Request, call_next: Any):
         if request.url.path == "/health" or request.method == "OPTIONS":
             return await call_next(request)
-        supplied = request.headers.get("authorization", "")
-        expected = f"Bearer {self.token}"
-        if not hmac.compare_digest(supplied, expected):
+        supplied = request.headers.get("authorization", "").encode("latin-1")
+        account = next((item for item in self.accounts if hmac.compare_digest(
+            supplied, f"Bearer {item.bearer_token}".encode("ascii")
+        )), None)
+        if account is None:
             return JSONResponse(
                 {"error": "unauthorized"},
                 status_code=401,
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        return await call_next(request)
+        mark = active_account.set(account)
+        try:
+            return await call_next(request)
+        finally:
+            active_account.reset(mark)
 
 
-settings = Settings.from_env()
-mail = MailClient(settings)
+def load_accounts() -> tuple[Settings, ...]:
+    raw = os.getenv("BEGET_ACCOUNTS_JSON")
+    if raw is None:
+        raise RuntimeError("Missing BEGET_ACCOUNTS_JSON configuration")
+    base = Settings(
+        email="", password="", bearer_token="",
+        imap_host=os.getenv("BEGET_IMAP_HOST", "imap.beget.com"),
+        imap_port=int(os.getenv("BEGET_IMAP_PORT", "993")),
+        smtp_host=os.getenv("BEGET_SMTP_HOST", "smtp.beget.com"),
+        smtp_port=int(os.getenv("BEGET_SMTP_PORT", "465")),
+        mailbox=os.getenv("BEGET_MAILBOX", "INBOX"),
+    )
+    try:
+        entries = json.loads(raw)
+        if not isinstance(entries, list) or not entries:
+            raise ValueError
+        accounts = tuple(replace(
+            base, email=item["email"], password=item["password"],
+            bearer_token=item["token"], mailbox=item.get("mailbox", base.mailbox),
+        ) for item in entries)
+    except (ValueError, TypeError, KeyError):
+        raise RuntimeError("Invalid BEGET_ACCOUNTS_JSON configuration") from None
+    if any(
+        not all(isinstance(value, str) and value.strip() for value in (
+            account.email, account.password, account.mailbox,
+        ))
+        or not isinstance(account.bearer_token, str)
+        or not re.fullmatch(r"[!-~]{32,}", account.bearer_token)
+        for account in accounts
+    ):
+        raise RuntimeError("Each account requires an email, password, mailbox and printable ASCII token of 32+ characters")
+    if len({account.bearer_token for account in accounts}) != len(accounts):
+        raise RuntimeError("Each account requires a distinct bearer token")
+    return accounts
+
+
+accounts = load_accounts()
+active_account: ContextVar[Settings] = ContextVar("active_account")
 used_confirmations: dict[bytes, int] = {}
 confirmation_lock = Lock()
 mcp = FastMCP(
     "Beget Mail",
+    stateless_http=True,
+    json_response=True,
     instructions=(
-        "Read and search one authenticated Beget mailbox. Never send an email until the user "
+        "Read and search the mailbox associated with your access token. Never send an email until the user "
         "has reviewed the exact recipients, subject, and body returned by prepare_email."
     ),
 )
@@ -408,7 +426,7 @@ def list_recent_emails(
     limit: int = Field(default=10, ge=1, le=MAX_RESULTS),
 ) -> EmailList:
     """List the newest messages in the configured mailbox without marking them as read."""
-    return mail.list_emails(limit)
+    return MailClient(active_account.get()).list_emails(limit)
 
 
 @mcp.tool(
@@ -420,7 +438,7 @@ def search_emails(
     limit: int = Field(default=10, ge=1, le=MAX_RESULTS),
 ) -> EmailList:
     """Search the configured mailbox by text in message headers or body."""
-    return mail.search_emails(query, limit)
+    return MailClient(active_account.get()).search_emails(query, limit)
 
 
 @mcp.tool(
@@ -429,7 +447,7 @@ def search_emails(
 )
 def get_email(uid: str = Field(pattern=r"^\d+$")) -> EmailDetail:
     """Read one email by the stable IMAP UID returned by list or search."""
-    return mail.get_email(uid)
+    return MailClient(active_account.get()).get_email(uid)
 
 
 @mcp.tool(
@@ -443,6 +461,7 @@ def prepare_email(
     cc: list[str] | None = None,
 ) -> PreparedEmail:
     """Prepare an exact email preview and short-lived token; this does not send anything."""
+    settings = active_account.get()
     clean_to, clean_cc = _validate_email_content(to, cc, subject, text)
     token = _make_confirmation_token(settings, clean_to, clean_cc, subject, text)
     return PreparedEmail(
@@ -468,6 +487,7 @@ def send_email(
     cc: list[str] | None = None,
 ) -> SendResult:
     """Send the exact email previously returned by prepare_email after explicit user approval."""
+    settings = active_account.get()
     clean_to, clean_cc = _validate_email_content(to, cc, subject, text)
     signature, expires = _verify_confirmation_token(
         settings, confirmation_token, clean_to, clean_cc, subject, text
@@ -479,11 +499,11 @@ def send_email(
         if expires < now or signature in used_confirmations:
             raise ValueError("Confirmation token expired or was already used")
         used_confirmations[signature] = expires
-    return mail.send(clean_to, clean_cc, subject, text)
+    return MailClient(settings).send(clean_to, clean_cc, subject, text)
 
 
 app = mcp.streamable_http_app()
-app.add_middleware(BearerTokenMiddleware, token=settings.bearer_token)
+app.add_middleware(BearerTokenMiddleware, accounts=accounts)
 
 
 async def health(_: Request) -> JSONResponse:
@@ -494,7 +514,7 @@ app.add_route("/health", health, methods=["GET"])
 
 
 def main() -> None:
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8000")))
 
 
 if __name__ == "__main__":
