@@ -1,0 +1,20 @@
+services:
+  beget-mail-mcp:
+    build: .
+    env_file:
+      - path: .env
+        format: raw
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8000"
+    ports:
+      - "127.0.0.1:${MCP_HOST_PORT:-8000}:8000"
+    mem_limit: "${MCP_MEMORY_LIMIT:-256m}"
+    cpus: "${MCP_CPU_LIMIT:-0.25}"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

@@ -13,9 +13,10 @@ import secrets
 import smtplib
 import ssl
 import time
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 from email import policy
 from email.header import decode_header, make_header
 from email.message import EmailMessage, Message
@@ -37,6 +38,31 @@ MAX_BODY_CHARS = 100_000
 MAX_SEND_BODY_CHARS = 100_000
 CONFIRMATION_TTL_SECONDS = 10 * 60
 CONFIRMATION_INSTANCE_KEY = secrets.token_bytes(32)
+
+
+def positive_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    raise RuntimeError(f"{name} must be a positive integer")
+
+
+MAIL_TIMEOUT = positive_env("BEGET_MAIL_TIMEOUT_SECONDS", 15)
+MAX_MESSAGE_BYTES = positive_env("BEGET_MAX_MESSAGE_BYTES", 2 * 1024 * 1024)
+mail_slots = BoundedSemaphore(positive_env("BEGET_MAX_CONCURRENT_OPERATIONS", 2))
+
+
+@contextmanager
+def mail_slot():
+    if not mail_slots.acquire(blocking=False):
+        raise RuntimeError("Mail server is busy. Try again shortly.")
+    try:
+        yield
+    finally:
+        mail_slots.release()
 
 
 @dataclass(frozen=True)
@@ -68,6 +94,7 @@ class EmailList(BaseModel):
 class EmailDetail(EmailSummary):
     text: str
     attachment_names: list[str]
+    body_omitted_reason: str | None = None
 
 
 class PreparedEmail(BaseModel):
@@ -160,12 +187,16 @@ class MailClient:
             self.settings.imap_host,
             self.settings.imap_port,
             ssl_context=ssl.create_default_context(),
+            timeout=MAIL_TIMEOUT,
         )
-        connection.login(self.settings.email, self.settings.password)
-        status, _ = connection.select(self.settings.mailbox, readonly=True)
-        if status != "OK":
-            connection.logout()
-            raise RuntimeError(f"Cannot open mailbox {self.settings.mailbox}")
+        try:
+            connection.login(self.settings.email, self.settings.password)
+            status, _ = connection.select(self.settings.mailbox, readonly=True)
+            if status != "OK":
+                raise RuntimeError("Cannot open configured mailbox")
+        except Exception:
+            connection.shutdown()
+            raise
         return connection
 
     def list_emails(self, limit: int) -> EmailList:
@@ -211,12 +242,20 @@ class MailClient:
             raise ValueError("uid must contain digits only")
         connection = self._imap()
         try:
-            status, data = connection.uid("fetch", uid, "(BODY.PEEK[] RFC822.SIZE)")
+            basic = self._fetch_summary(connection, uid)
+            if basic.size_bytes is None or basic.size_bytes > MAX_MESSAGE_BYTES:
+                reason = ("IMAP did not report message size" if basic.size_bytes is None
+                          else f"Message exceeds the {MAX_MESSAGE_BYTES}-byte download limit")
+                return EmailDetail(**basic.model_dump(), text="", attachment_names=[],
+                                   body_omitted_reason=reason)
+            status, data = connection.uid("fetch", uid, f"(BODY.PEEK[]<0.{MAX_MESSAGE_BYTES + 1}>)")
             if status != "OK" or not data or data[0] is None:
                 raise ValueError(f"Email UID {uid} was not found")
             raw = _extract_message_bytes(data)
+            if len(raw) != basic.size_bytes:
+                return EmailDetail(**basic.model_dump(), text="", attachment_names=[],
+                                   body_omitted_reason="IMAP returned an unexpected message size")
             message = BytesParser(policy=policy.default).parsebytes(raw)
-            basic = _summary(uid, raw, len(raw))
             return EmailDetail(
                 **basic.model_dump(),
                 text=_message_text(message),
@@ -237,6 +276,7 @@ class MailClient:
             self.settings.smtp_host,
             self.settings.smtp_port,
             context=ssl.create_default_context(),
+            timeout=MAIL_TIMEOUT,
         ) as smtp:
             smtp.login(self.settings.email, self.settings.password)
             refused = smtp.send_message(message)
@@ -422,6 +462,7 @@ mcp = FastMCP(
     title="List recent emails",
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
 )
+@mail_slot()
 def list_recent_emails(
     limit: int = Field(default=10, ge=1, le=MAX_RESULTS),
 ) -> EmailList:
@@ -433,6 +474,7 @@ def list_recent_emails(
     title="Search emails",
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
 )
+@mail_slot()
 def search_emails(
     query: str = Field(min_length=1, max_length=500),
     limit: int = Field(default=10, ge=1, le=MAX_RESULTS),
@@ -445,6 +487,7 @@ def search_emails(
     title="Read email",
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
 )
+@mail_slot()
 def get_email(uid: str = Field(pattern=r"^\d+$")) -> EmailDetail:
     """Read one email by the stable IMAP UID returned by list or search."""
     return MailClient(active_account.get()).get_email(uid)
@@ -479,6 +522,7 @@ def prepare_email(
     title="Send email",
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True),
 )
+@mail_slot()
 def send_email(
     to: list[str],
     subject: str,

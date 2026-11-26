@@ -23,20 +23,25 @@ Beget Mail MCP подключает ящики Beget к MCP-клиентам ч�
 
 ## Локальный запуск
 
-### Docker
+### Docker Compose
+
+Нужен Docker Compose 2.30+.
+
+При первом запуске создайте `.env` из шаблона:
 
 ```bash
 cp .env.example .env
 ```
 
-Заполните `.env`, затем соберите образ и запустите контейнер:
+Заполните `.env`, затем запустите или обновите сервис:
 
 ```bash
-docker build -t beget-mail-mcp .
-docker run -d --name beget-mail-mcp \
-  --env-file .env -e HOST=0.0.0.0 -e PORT=8000 \
-  -p 127.0.0.1:8000:8000 beget-mail-mcp
+docker compose up -d --build --wait
 ```
+
+После изменения настроек в `.env` примените их командой `docker compose up -d --force-recreate --wait`.
+
+Compose публикует порт только на `127.0.0.1` и запускает контейнер с лимитами 256 МиБ и 0,25 CPU. В `.env` можно задать `MCP_HOST_PORT`, `MCP_MEMORY_LIMIT` и `MCP_CPU_LIMIT`. Проверка здоровья показывает, отвечает ли сервис. Для проверки почты вызовите `list_recent_emails` с токеном нужного ящика.
 
 ### Python
 
@@ -67,7 +72,7 @@ MCP endpoint: `http://localhost:8000/mcp`.
 
 Задайте список учётных записей в `BEGET_ACCOUNTS_JSON`. Для каждой записи укажите полный адрес, пароль ящика и отдельный токен от 32 символов. Токены можно сгенерировать командой `openssl rand -hex 32`. Храните рабочий `.env` локально.
 
-Пример строки для Docker `--env-file`:
+Пример строки в `.env`:
 
 ```dotenv
 BEGET_ACCOUNTS_JSON=[{"email":"first@example.com","password":"replace-me","token":"replace-with-unique-token-one-32chars"},{"email":"second@example.com","password":"replace-me","token":"replace-with-unique-token-two-32chars"}]
@@ -80,6 +85,22 @@ BEGET_ACCOUNTS_JSON=[{"email":"first@example.com","password":"replace-me","token
 Клиенту нужна поддержка Streamable HTTP и заголовка `Authorization: Bearer <токен ящика>`. Для клиента на том же компьютере укажите `http://127.0.0.1:8000/mcp`. Для удалённого клиента используйте доступный ему URL с HTTPS и тем же путём `/mcp`.
 
 При отправке клиент должен показать предпросмотр и запросить подтверждение пользователя перед вызовом `send_email`. Сервер проверяет содержимое письма и токен, а подтверждение человеком обеспечивает клиент.
+
+### Desktop через SSH
+
+На Mac откройте туннель к порту Compose на сервере:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8765:127.0.0.1:8000 user@server
+```
+
+Оставьте туннель запущенным. Если порт 8765 занят, выберите свободный локальный порт. В настройках Desktop добавьте Streamable HTTP сервер `http://127.0.0.1:8765/mcp`. Для каждого ящика добавьте отдельное подключение с тем же URL и своим Bearer-токеном. Если клиент берёт токен из переменной окружения, задайте разные имена переменных для разных подключений.
+
+## Ограничения почтовых операций
+
+По умолчанию сокет IMAP/SMTP ждёт до 15 секунд на операцию ввода-вывода, а сервис выполняет не более двух почтовых операций одновременно. При перегрузке клиент получает сообщение с просьбой повторить попытку. Перед загрузкой письма сервис проверяет его полный размер, включая вложения. Если он превышает 2 МиБ, клиент получает заголовки и причину пропуска тела.
+
+Настройки в `.env`: `BEGET_MAIL_TIMEOUT_SECONDS`, `BEGET_MAX_CONCURRENT_OPERATIONS` и `BEGET_MAX_MESSAGE_BYTES`.
 
 ## Безопасность MVP
 
