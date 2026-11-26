@@ -1,0 +1,28 @@
+[project]
+name = "beget-mail-mcp"
+version = "0.1.0"
+description = "Minimal secure MCP server for a Beget mailbox"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.18,<2",
+  "pydantic>=2.7,<3",
+  "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+beget-mail-mcp = "beget_mail_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/beget_mail_mcp"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+

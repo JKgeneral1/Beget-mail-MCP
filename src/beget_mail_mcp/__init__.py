@@ -1,0 +1,2 @@
+"""Beget Mail MCP server."""
+
