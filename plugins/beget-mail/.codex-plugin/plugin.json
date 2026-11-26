@@ -1,0 +1,10 @@
+{
+  "name": "beget-mail",
+  "version": "0.1.0",
+  "description": "Search, read and prepare email using a connected Beget Mail MCP server.",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Beget Mail",
+    "shortDescription": "Use your Beget mailbox through MCP."
+  }
+}

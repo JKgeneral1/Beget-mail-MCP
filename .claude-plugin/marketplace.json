@@ -1,0 +1,12 @@
+{
+  "name": "beget-mail",
+  "interface": {"displayName": "Beget Mail"},
+  "plugins": [
+    {
+      "name": "beget-mail",
+      "source": {"source": "local", "path": "./plugins/beget-mail"},
+      "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+      "category": "Productivity"
+    }
+  ]
+}
